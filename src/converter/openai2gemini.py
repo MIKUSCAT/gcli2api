@@ -842,9 +842,19 @@ def extract_tool_calls_from_parts(
     text_content = ""
 
     for idx, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
         # 检查是否是函数调用
+        function_call_key = None
         if "functionCall" in part:
-            function_call = part["functionCall"]
+            function_call_key = "functionCall"
+        elif "function_call" in part:
+            function_call_key = "function_call"
+
+        if function_call_key:
+            function_call = part.get(function_call_key)
+            if not isinstance(function_call, dict):
+                continue
             # 获取原始ID或生成新ID
             original_id = function_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
             # 将thoughtSignature编码到ID中以便往返保留
@@ -852,7 +862,11 @@ def extract_tool_calls_from_parts(
             encoded_id = encode_tool_id_with_signature(original_id, signature)
 
             # 获取参数并转换类型
-            args = function_call.get("args", {})
+            args = function_call.get("args")
+            if args is None:
+                args = function_call.get("arguments")
+            if args is None:
+                args = {}
             # 将字符串类型的值转回原始类型
             args = _reverse_transform_args(args)
 

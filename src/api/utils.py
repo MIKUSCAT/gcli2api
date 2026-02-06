@@ -263,13 +263,159 @@ async def collect_streaming_response(stream_generator) -> Response:
         }
     }
 
-    collected_text = []  # 用于收集文本内容
-    collected_thought_text = []  # 用于收集思维链内容
-    collected_other_parts = []  # 用于收集其他类型的parts（图片、文件等）
+    ordered_segments = []  # 按原始顺序收集part，避免丢失 functionCall/functionResponse
+    text_chunk_count = 0
+    thought_chunk_count = 0
+    other_part_count = 0
+    tool_part_count = 0
+    tool_call_part_count = 0
+    tool_response_part_count = 0
+    unique_tool_call_count = 0
+    collected_tool_names = set()
+    tool_call_segment_index = {}
+    tool_response_segment_index = {}
+    last_tool_call_segment_idx_without_id = None
+    last_tool_response_segment_idx_without_id = None
     has_data = False
     line_count = 0
 
     log.debug("[STREAM COLLECTOR] Starting to collect streaming response")
+
+    def _is_empty_value(value: Any) -> bool:
+        return value in (None, "", {}, [])
+
+    def _merge_value(old_value: Any, new_value: Any) -> Any:
+        """
+        合并同一 tool call 在流式输出中的分片数据。
+
+        - dict: 递归合并
+        - str: 尽量按“增量拼接”处理，避免重复
+        - list: 优先选更长的前缀一致版本，否则拼接
+        - 其他: new 非空则覆盖
+        """
+        if _is_empty_value(new_value):
+            return old_value
+        if old_value is None:
+            return new_value
+
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            merged = old_value.copy()
+            for key, value in new_value.items():
+                if key in merged:
+                    merged[key] = _merge_value(merged.get(key), value)
+                else:
+                    merged[key] = value
+            return merged
+
+        if isinstance(old_value, list) and isinstance(new_value, list):
+            if not old_value:
+                return new_value
+            if not new_value:
+                return old_value
+            if len(new_value) >= len(old_value) and new_value[: len(old_value)] == old_value:
+                return new_value
+            if len(old_value) >= len(new_value) and old_value[: len(new_value)] == new_value:
+                return old_value
+            return old_value + new_value
+
+        if isinstance(old_value, str) and isinstance(new_value, str):
+            if not old_value:
+                return new_value
+            if not new_value:
+                return old_value
+            if new_value.startswith(old_value):
+                return new_value
+            if old_value.startswith(new_value):
+                return old_value
+            return old_value + new_value
+
+        return new_value
+
+    def _merge_part(old_part: Dict[str, Any], new_part: Dict[str, Any]) -> Dict[str, Any]:
+        merged = old_part.copy()
+        for key, value in new_part.items():
+            if key in merged:
+                merged[key] = _merge_value(merged.get(key), value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _get_pending_tool_segment_idx(kind: str, expected_name: str) -> Optional[int]:
+        idx = None
+        if kind == "functionCall":
+            idx = last_tool_call_segment_idx_without_id
+        elif kind == "functionResponse":
+            idx = last_tool_response_segment_idx_without_id
+
+        if idx is None or idx >= len(ordered_segments):
+            return None
+
+        seg = ordered_segments[idx]
+        seg_part = seg.get("part") if isinstance(seg, dict) else None
+        if not isinstance(seg_part, dict):
+            return None
+
+        payload = seg_part.get(kind)
+        if not isinstance(payload, dict):
+            return None
+
+        seg_id = str(payload.get("id", "")).strip()
+        if seg_id:
+            return None
+
+        seg_name = str(payload.get("name", "")).strip()
+        if expected_name and seg_name and seg_name != expected_name:
+            return None
+
+        return idx
+
+    def _upsert_tool_segment(part: Dict[str, Any], kind: str, payload: Dict[str, Any]) -> tuple[Optional[int], bool]:
+        """
+        返回 (segment_idx, is_new_segment)。
+
+        - 有 id: 优先按 id 复用；如果之前有一个“无 id 的 pending 段”，且 name 匹配，则合并到那里
+        - 无 id: 尝试合并到 pending 段，否则新建一个 pending 段
+        """
+        nonlocal last_tool_call_segment_idx_without_id, last_tool_response_segment_idx_without_id
+
+        part_id = str(payload.get("id", "")).strip()
+        part_name = str(payload.get("name", "")).strip()
+
+        index_map = tool_call_segment_index if kind == "functionCall" else tool_response_segment_index
+
+        if part_id:
+            if part_id in index_map:
+                return index_map[part_id], False
+
+            pending_idx = _get_pending_tool_segment_idx(kind, part_name)
+            if pending_idx is not None:
+                index_map[part_id] = pending_idx
+                if kind == "functionCall":
+                    last_tool_call_segment_idx_without_id = None
+                else:
+                    last_tool_response_segment_idx_without_id = None
+                return pending_idx, False
+
+            ordered_segments.append({"type": "raw", "part": part.copy()})
+            idx = len(ordered_segments) - 1
+            index_map[part_id] = idx
+            if kind == "functionCall":
+                last_tool_call_segment_idx_without_id = None
+            else:
+                last_tool_response_segment_idx_without_id = None
+            return idx, True
+
+        pending_idx = _get_pending_tool_segment_idx(kind, part_name)
+        if pending_idx is not None:
+            return pending_idx, False
+
+        ordered_segments.append({"type": "raw", "part": part.copy()})
+        idx = len(ordered_segments) - 1
+        if kind == "functionCall":
+            last_tool_call_segment_idx_without_id = idx
+        else:
+            last_tool_response_segment_idx_without_id = idx
+        return idx, True
 
     try:
         async for line in stream_generator:
@@ -330,20 +476,97 @@ async def collect_streaming_response(stream_generator) -> Response:
                     if not isinstance(part, dict):
                         continue
 
-                    # 处理文本内容
+                    # 1) 优先保留工具相关part（连续工具调用场景关键）
+                    if "functionCall" in part or "functionResponse" in part:
+                        tool_part_count += 1
+                        function_call = part.get("functionCall")
+                        function_response = part.get("functionResponse")
+
+                        # functionCall 分片（连续工具调用时常见）
+                        if isinstance(function_call, dict):
+                            tool_call_part_count += 1
+                            tool_name = function_call.get("name")
+                            tool_name_str = str(tool_name).strip() if isinstance(tool_name, str) else ""
+                            if tool_name_str:
+                                collected_tool_names.add(tool_name_str)
+
+                            seg_idx, is_new_segment = _upsert_tool_segment(part, "functionCall", function_call)
+                            if seg_idx is not None:
+                                if is_new_segment:
+                                    unique_tool_call_count += 1
+                                else:
+                                    existing = ordered_segments[seg_idx].get("part") if isinstance(ordered_segments[seg_idx], dict) else None
+                                    if isinstance(existing, dict):
+                                        ordered_segments[seg_idx] = {"type": "raw", "part": _merge_part(existing, part)}
+                                    else:
+                                        ordered_segments[seg_idx] = {"type": "raw", "part": part.copy()}
+
+                            log.debug(
+                                f"[STREAM COLLECTOR] Collected tool call part (merged={not is_new_segment}): "
+                                f"id={str(function_call.get('id', '')).strip() or '-'}, "
+                                f"name={tool_name_str or '-'}"
+                            )
+                            continue
+
+                        # functionResponse 分片（工具返回）
+                        if isinstance(function_response, dict):
+                            tool_response_part_count += 1
+                            seg_idx, is_new_segment = _upsert_tool_segment(part, "functionResponse", function_response)
+                            if seg_idx is not None and not is_new_segment:
+                                existing = ordered_segments[seg_idx].get("part") if isinstance(ordered_segments[seg_idx], dict) else None
+                                if isinstance(existing, dict):
+                                    ordered_segments[seg_idx] = {"type": "raw", "part": _merge_part(existing, part)}
+                                else:
+                                    ordered_segments[seg_idx] = {"type": "raw", "part": part.copy()}
+
+                            log.debug(
+                                f"[STREAM COLLECTOR] Collected tool response part (merged={not is_new_segment}): "
+                                f"id={str(function_response.get('id', '')).strip() or '-'}, "
+                                f"name={str(function_response.get('name', '')).strip() or '-'}"
+                            )
+                            continue
+
+                        # 兜底：字段存在但结构不符合预期，也要保留，避免吞掉
+                        ordered_segments.append({"type": "raw", "part": part.copy()})
+                        other_part_count += 1
+                        log.debug(f"[STREAM COLLECTOR] Collected tool-ish raw part: {list(part.keys())}")
+                        continue
+
+                    # 2) 处理文本内容（按块记录，最后再做相邻合并，保持整体顺序）
                     text = part.get("text", "")
-                    if text:
-                        # 区分普通文本和思维链
+                    if isinstance(text, str) and text:
                         if part.get("thought", False):
-                            collected_thought_text.append(text)
+                            ordered_segments.append({"type": "thought_text", "text": text})
+                            thought_chunk_count += 1
                             log.debug(f"[STREAM COLLECTOR] Collected thought text: {text[:100]}")
                         else:
-                            collected_text.append(text)
+                            ordered_segments.append({"type": "text", "text": text})
+                            text_chunk_count += 1
                             log.debug(f"[STREAM COLLECTOR] Collected regular text: {text[:100]}")
-                    # 处理非文本内容（图片、文件等）
-                    elif "inlineData" in part or "fileData" in part or "executableCode" in part or "codeExecutionResult" in part:
-                        collected_other_parts.append(part)
+                        continue
+
+                    # 3) 处理明确的非文本内容（图片、文件、代码等）
+                    if (
+                        "inlineData" in part
+                        or "fileData" in part
+                        or "executableCode" in part
+                        or "codeExecutionResult" in part
+                    ):
+                        ordered_segments.append({"type": "raw", "part": part.copy()})
+                        other_part_count += 1
                         log.debug(f"[STREAM COLLECTOR] Collected non-text part: {list(part.keys())}")
+                        continue
+
+                    # 4) 保底：只要part有非空字段就保留，避免未来新增字段被吞掉
+                    has_valid_payload = any(
+                        value not in (None, "", {}, [])
+                        for key, value in part.items()
+                        if key != "thought"
+                    )
+                    if has_valid_payload:
+                        ordered_segments.append({"type": "raw", "part": part.copy()})
+                        other_part_count += 1
+                        log.debug(f"[STREAM COLLECTOR] Collected fallback raw part: {list(part.keys())}")
 
                 # 收集其他信息（使用最后一个块的值）
                 if candidate.get("finishReason"):
@@ -386,24 +609,46 @@ async def collect_streaming_response(stream_generator) -> Response:
             media_type="application/json"
         )
 
-    # 组装最终的parts
+    # 组装最终的parts（保持结构化part顺序，只合并相邻文本块）
     final_parts = []
 
-    # 先添加思维链内容（如果有）
-    if collected_thought_text:
-        final_parts.append({
-            "text": "".join(collected_thought_text),
-            "thought": True
-        })
+    for segment in ordered_segments:
+        seg_type = segment.get("type")
 
-    # 再添加普通文本内容
-    if collected_text:
-        final_parts.append({
-            "text": "".join(collected_text)
-        })
+        if seg_type == "raw":
+            part = segment.get("part")
+            if isinstance(part, dict):
+                final_parts.append(part)
+            continue
 
-    # 添加其他类型的parts（图片、文件等）
-    final_parts.extend(collected_other_parts)
+        if seg_type not in ("text", "thought_text"):
+            continue
+
+        text_value = segment.get("text")
+        if not isinstance(text_value, str) or not text_value:
+            continue
+
+        is_thought = seg_type == "thought_text"
+        if final_parts:
+            last_part = final_parts[-1]
+            if (
+                isinstance(last_part, dict)
+                and isinstance(last_part.get("text"), str)
+                and set(last_part.keys()).issubset({"text", "thought"})
+                and bool(last_part.get("thought", False)) == is_thought
+            ):
+                last_part["text"] += text_value
+                continue
+
+        if is_thought:
+            final_parts.append({
+                "text": text_value,
+                "thought": True
+            })
+        else:
+            final_parts.append({
+                "text": text_value
+            })
 
     # 如果没有任何内容，添加空文本
     if not final_parts:
@@ -411,7 +656,17 @@ async def collect_streaming_response(stream_generator) -> Response:
 
     merged_response["response"]["candidates"][0]["content"]["parts"] = final_parts
 
-    log.info(f"[STREAM COLLECTOR] Collected {len(collected_text)} text chunks, {len(collected_thought_text)} thought chunks, and {len(collected_other_parts)} other parts")
+    tool_names_str = ", ".join(sorted(collected_tool_names)) if collected_tool_names else "-"
+    log.info(
+        "[STREAM COLLECTOR] Collected "
+        f"{text_chunk_count} text chunks, "
+        f"{thought_chunk_count} thought chunks, "
+        f"{tool_part_count} tool parts "
+        f"({tool_call_part_count} functionCall/{tool_response_part_count} functionResponse, "
+        f"{unique_tool_call_count} unique functionCall), "
+        f"and {other_part_count} other parts; "
+        f"tools={tool_names_str}"
+    )
 
     # 去掉嵌套的 "response" 包装（Antigravity格式 -> 标准Gemini格式）
     if "response" in merged_response and "candidates" not in merged_response:
